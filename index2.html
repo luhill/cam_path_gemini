@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Marlin Trochoidal CAM Studio</title>
+    <style>
+        body { font-family: sans-serif; margin: 0; padding: 20px; background: #1e1e24; color: #e0e0e0; display: flex; gap: 20px; height: 100vh; box-sizing: border-box;}
+        .sidebar { width: 350px; background: #2a2a35; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.3); overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+        .main-panel { flex: 1; display: flex; flex-direction: column; gap: 20px; }
+        .canvas-container { flex: 1; background: #111; border-radius: 8px; position: relative; min-height: 300px; box-shadow: inset 0 0 20px rgba(0,0,0,0.8); }
+        canvas { width: 100%; height: 100%; border-radius: 8px; display: block; }
+        label { font-size: 13px; font-weight: bold; color: #aaa; }
+        input, select { width: 100%; padding: 8px; background: #3a3a4a; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; }
+        button { background: #0076d6; color: white; border: none; padding: 12px; font-size: 15px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #005ea6; }
+        textarea { width: 100%; height: 150px; font-family: monospace; background: #111; color: #0f0; border: 1px solid #444; padding: 10px; box-sizing: border-box; border-radius: 4px; }
+        .file-input { background: #4a3b5c; border: 1px dashed #9b5de5; padding: 15px; text-align: center; border-radius: 4px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <h3>Marlin Trochoidal Studio</h3>
+        
+        <div class="file-input" onclick="document.getElementById('stlFile').click()">
+            <span id="fileLabel">📁 Drop or Click to Load STL</span>
+            <input type="file" id="stlFile" accept=".stl" style="display:none;" onchange="handleSTLLoad(event)">
+        </div>
+
+        <label for="sliceZ">Slice Height for Outline (mm Z):</label>
+        <input type="number" id="sliceZ" value="0.2" step="0.1" onchange="processSTL()">
+
+        <label for="toolDia">Tool Diameter (mm):</label>
+        <input type="number" id="toolDia" value="4.0" step="0.1" onchange="processSTL()">
+
+        <label for="slotWidth">Desired Channel Width (mm):</label>
+        <input type="number" id="slotWidth" value="6.0" step="0.1" onchange="processSTL()">
+
+        <label for="stepover">Stepover / Optimal Load (mm):</label>
+        <input type="number" id="stepover" value="0.3" step="0.05" onchange="processSTL()">
+
+        <label for="cutDepth">Total Cut Depth (mm):</label>
+        <input type="number" id="cutDepth" value="2.0" step="0.1">
+
+        <label for="feedrate">Cutting Feedrate (mm/min):</label>
+        <input type="number" id="feedrate" value="320">
+
+        <button onclick="generateGCode()">Generate Marlin G-Code</button>
+        
+        <label>Export Output:</label>
+        <textarea id="gcodeOutput" placeholder="G-code will appear here..."></textarea>
+    </div>
+
+    <div class="main-panel">
+        <div class="canvas-container">
+            <canvas id="previewCanvas"></canvas>
+        </div>
+    </div>
+
+<script>
+let stlGeometry = null;
+let extractedPoints = [];
+let toolpathLines = [];
+
+function handleSTLLoad(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    document.getElementById('fileLabel').innerText = file.name;
+    
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        parseBinarySTL(event.target.result);
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+function parseBinarySTL(buffer) {
+    const view = new DataView(buffer);
+    const numTriangles = view.getUint32(8, true);
+    let triangles = [];
+    let offset = 12;
+
+    for (let i = 0; i < numTriangles; i++) {
+        offset += 12; // Skip normal vector data
+        let v1 = { x: view.getFloat32(offset, true), y: view.getFloat32(offset+4, true), z: view.getFloat32(offset+8, true) };
+        let v2 = { x: view.getFloat32(offset+12, true), y: view.getFloat32(offset+16, true), z: view.getFloat32(offset+20, true) };
+        let v3 = { x: view.getFloat32(offset+24, true), y: view.getFloat32(offset+28, true), z: view.getFloat32(offset+32, true) };
+        offset += 38; // Move past attributes
+        triangles.push([v1, v2, v3]);
+    }
+    stlGeometry = triangles;
+    processSTL();
+}
+
+function processSTL() {
+    if (!stlGeometry) return;
+    const sliceZ = parseFloat(document.getElementById('sliceZ').value);
+    let segments = [];
+
+    // Slice triangles at plane Z
+    for (let tri of stlGeometry) {
+        let lines = [];
+        for (let i = 0; i < 3; i++) {
+            let p1 = tri[i];
+            let p2 = tri[(i + 1) % 3];
+            if ((p1.z >= sliceZ && p2.z < sliceZ) || (p2.z >= sliceZ && p1.z < sliceZ)) {
+                let t = (sliceZ - p1.z) / (p2.z - p1.z);
+                lines.push({ x: p1.x + t * (p2.x - p1.x), y: p1.y + t * (p2.y - p1.y) });
+            }
+        }
+        if (lines.length === 2) segments.push(lines);
+    }
+
+    // Sort segments into a continuous outer loop outline
+    if (segments.length === 0) return;
+    extractedPoints = [];
+    let current = segments.shift();
+    extractedPoints.push(current[0], current[1]);
+
+    while (segments.length > 0) {
+        let lastPt = extractedPoints[extractedPoints.length - 1];
+        let foundIndex = -1;
+        let reverse = false;
+
+        for (let i = 0; i < segments.length; i++) {
+            let d0 = Math.hypot(segments[i][0].x - lastPt.x, segments[i][0].y - lastPt.y);
+            let d1 = Math.hypot(segments[i][1].x - lastPt.x, segments[i][1].y - lastPt.y);
+            if (d0 < 0.05) { foundIndex = i; reverse = false; break; }
+            if (d1 < 0.05) { foundIndex = i; reverse = true; break; }
+        }
+
+        if (foundIndex !== -1) {
+            let nextSeg = segments.splice(foundIndex, 1)[0];
+            extractedPoints.push(reverse ? nextSeg[0] : nextSeg[1]);
+        } else {
+            break; // Handle broken perimeter paths cleanly
+        }
+    }
+    calculateTrochoidalPreview();
+}
+
+function calculateTrochoidalPreview() {
+    if (extractedPoints.length < 2) return;
+    const toolDia = parseFloat(document.getElementById('toolDia').value);
+    const slotWidth = parseFloat(document.getElementById('slotWidth').value);
+    const stepover = parseFloat(document.getElementById('stepover').value);
+    const trochoidRadius = (slotWidth - toolDia) / 2;
+
+    toolpathLines = [];
+    if (trochoidRadius <= 0) return;
+
+    for (let i = 0; i < extractedPoints.length - 1; i++) {
+        let p1 = extractedPoints[i];
+        let p2 = extractedPoints[i+1];
+        let dx = p2.x - p1.x, dy = p2.y - p1.y;
+        let dist = Math.hypot(dx, dy);
+        let steps = Math.ceil(dist / stepover);
+
+        for (let s = 0; s <= steps; s++) {
+            let t = s / steps;
+            let cx = p1.x + dx * t;
+            let cy = p1.y + dy * t;
+            let circlePoints = [];
+
+            for (let a = 0; a <= 12; a++) {
+                let theta = (a / 12) * Math.PI * 2;
+                circlePoints.push({ x: cx + Math.cos(theta) * trochoidRadius, y: cy + Math.sin(theta) * trochoidRadius });
+            }
+            toolpathLines.push(circlePoints);
+        }
+    }
+    drawPreview();
+}
+
+function drawPreview() {
+    const canvas = document.getElementById('previewCanvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = canvas.parentElement.clientWidth;
+    canvas.height = canvas.parentElement.clientHeight;
+
+    if (extractedPoints.length === 0) return;
+
+    // Auto-fit framing math
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    extractedPoints.forEach(p => {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    });
+
+    let scale = Math.min((canvas.width - 60) / (maxX - minX), (canvas.height - 60) / (maxY - minY));
+    let offsetX = (canvas.width - (maxX - minX) * scale) / 2 - minX * scale;
+    let offsetY = (canvas.height - (maxY - minY) * scale) / 2 - minY * scale;
+
+    const transform = p => ({ x: p.x * scale + offsetX, y: canvas.height - (p.y * scale + offsetY) });
+
+    // 1. Draw Core Solid Outline Shape
+    ctx.strokeStyle = '#9b5de5';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    let start = transform(extractedPoints[0]);
+    ctx.moveTo(start.x, start.y);
+    extractedPoints.forEach(p => { let pt = transform(p); ctx.lineTo(pt.x, pt.y); });
+    ctx.stroke();
+
+    // 2. Draw Dynamic Looping Path Preview
+    ctx.strokeStyle = 'rgba(0, 118, 214, 0.4)';
+    ctx.lineWidth = 1;
+    toolpathLines.forEach(circle => {
+        ctx.beginPath();
+        let sPt = transform(circle[0]);
+        ctx.moveTo(sPt.x, sPt.y);
+        circle.forEach(p => { let pt = transform(p); ctx.lineTo(pt.x, pt.y); });
+        ctx.stroke();
+    });
+}
+
+function generateGCode() {
+    if (toolpathLines.length === 0) { alert("Please load an STL model first."); return; }
+    const totalDepth = parseFloat(document.getElementById('cutDepth').value);
+    const F_cut = document.getElementById('feedrate').value;
+    const toolDia = parseFloat(document.getElementById('toolDia').value);
+    const slotWidth = parseFloat(document.getElementById('slotWidth').value);
+    const trochoidRadius = (slotWidth - toolDia) / 2;
+
+    let gcode = `G21 ; set units to MM\nG90 ; absolute position mode\nG92 X0 Y0 Z0\nM3 S10000 ; spin up router\n\n`;
+    
+    // Smooth Spiral Entry calculations at origin point
+    let startPt = extractedPoints[0];
+    gcode += `G0 Z2.000 ; rapid lift\n`;
+    gcode += `G0 X${startPt.x.toFixed(3)} Y${startPt.y.toFixed(3)} ; travel to perimeter origin\n`;
+    
+    let zPlunge = 0;
+    let angle = 0;
+    while (zPlunge > -totalDepth) {
+        zPlunge -= (totalDepth / 24);
+        if (zPlunge < -totalDepth) zPlunge = -totalDepth;
+        angle += Math.PI / 4;
+        let hX = startPt.x + Math.cos(angle) * (trochoidRadius / 2);
+        let hY = startPt.y + Math.sin(angle) * (trochoidRadius / 2);
+        gcode += `G1 X${hX.toFixed(3)} Y${hY.toFixed(3)} Z${zPlunge.toFixed(3)} F100 ; helical bore entry\n`;
+    }
+
+    // Unroll linear concentric circles along full perimeter
+    gcode += `;\n; --- BEGIN TROCHOIDAL CHANNEL ENGAGEMENT ---\n`;
+    toolpathLines.forEach(circle => {
+        circle.forEach(p => {
+            gcode += `G1 X${p.x.toFixed(3)} Y${p.y.toFixed(3)} F${F_cut}\n`;
+        });
+    });
+
+    gcode += `\nG0 Z10.000 ; safe Z lift clear\nG0 X0 Y0 ; return machine home\nM5 ; turn off spindle\n`;
+    document.getElementById('gcodeOutput').value = gcode;
+}
+
+window.addEventListener('resize', drawPreview);
+</script>
+</body>
+</html>
